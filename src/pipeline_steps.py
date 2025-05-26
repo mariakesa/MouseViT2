@@ -82,7 +82,7 @@ class ImageToEmbeddingStep(PipelineStep):
         self.embedding_cache_dir.mkdir(parents=True, exist_ok=True)
 
         self.model_prefix = self.model_name.replace('/', '_')
-        self.embeddings_file = self.embedding_cache_dir / f"{self.model_prefix}_softmax_embeddings_softmax.pkl"
+        self.embeddings_file = self.embedding_cache_dir / f"{self.model_prefix}_embeddings_softmax.pkl"
 
     def process(self, data):
         raw_data_dct = data['raw_data_dct']

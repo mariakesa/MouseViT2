@@ -10,6 +10,8 @@ from torch.nn.functional import softmax
 from data_loader import allen_api
 import os
 from dotenv import load_dotenv
+from sklearn.model_selection import GridSearchCV
+from sklearn.linear_model import LogisticRegression
 
 load_dotenv()
 
@@ -157,6 +159,94 @@ class AllenViTRegressionDatasetBuilder(PipelineStep):
 
         data['X_embed'] = X_embed
         return data
+    
+class L1GLMNeuralFitStep(PipelineStep):
+    def __init__(self, save_path='glm_weights.npy', Cs=np.logspace(-3, 1, 6)):
+        self.save_path = save_path
+        self.Cs = Cs
+
+    def process(self, data):
+        X_embed = data['X_embed']
+        X_neural = data['X_neural']
+        models = []
+        weight_matrix = np.zeros((X_neural.shape[1], X_embed.shape[1]))
+
+        #for i in range(X_neural.shape[1]):
+        for i in range(5):
+            y = X_neural[:, i]
+            clf = GridSearchCV(
+                LogisticRegression(penalty='l1', solver='saga', max_iter=1000),
+                param_grid={'C': self.Cs},
+                scoring='neg_log_loss',
+                cv=5,
+                n_jobs=-1
+            )
+            clf.fit(X_embed, y)
+            best_model = clf.best_estimator_
+            models.append(best_model)
+            weight_matrix[i, :] = best_model.coef_
+
+        data['glm_models'] = models
+        np.save(self.save_path, weight_matrix)
+        print(f"Saved logistic regression weights to {self.save_path}")
+        return data
+
+class AnalysisPipeline:
+    def __init__(self, steps):
+        self.steps = steps
+
+    def run(self, data):
+        for step in self.steps:
+            data = step.process(data)
+        return data
+
+def make_container_dict(boc):
+    experiment_container = boc.get_experiment_containers()
+    container_ids = [dct['id'] for dct in experiment_container]
+    eids = boc.get_ophys_experiments(experiment_container_ids=container_ids)
+    df = pd.DataFrame(eids)
+    reduced_df = df[['id', 'experiment_container_id', 'session_type']]
+    grouped_df = reduced_df.groupby(['experiment_container_id', 'session_type'])['id'].agg(list).reset_index()
+    eid_dict = {}
+    for row in grouped_df.itertuples(index=False):
+        c_id, sess_type, ids = row
+        if c_id not in eid_dict:
+            eid_dict[c_id] = {}
+        eid_dict[c_id][sess_type] = ids[0]
+    return eid_dict
+
+if __name__ == '__main__':
+    boc = allen_api.get_boc()
+    eid_dict = make_container_dict(boc)
+    stimulus_session_dict = {
+        'three_session_A': ['natural_movie_one', 'natural_movie_three'],
+        'three_session_B': ['natural_movie_one', 'natural_scenes'],
+        'three_session_C': ['natural_movie_one', 'natural_movie_two'],
+        'three_session_C2': ['natural_movie_one', 'natural_movie_two']
+    }
+
+    embedding_cache_dir = os.environ.get('TRANSF_EMBEDDING_PATH', 'embeddings_cache')
+    container_id = list(eid_dict.keys())[0]
+    session = list(eid_dict[container_id].keys())[0]
+    stimulus = stimulus_session_dict.get(session, [])[0]
+
+    print(f"Running pipeline for container_id={container_id}, session={session}, stimulus={stimulus}")
+
+    pipeline = AnalysisPipeline([
+        AllenStimuliFetchStep(boc),
+        ImageToEmbeddingStep(embedding_cache_dir),
+        AllenNeuralResponseExtractor(boc, eid_dict, stimulus_session_dict),
+        AllenViTRegressionDatasetBuilder(),
+        L1GLMNeuralFitStep(save_path='glm_weights.npy')
+    ])
+
+    result = pipeline.run((container_id, session, stimulus))
+
+    print("Embed shape:", result['X_embed'].shape)
+    print("Neural shape:", result['X_neural'].shape)
+    print(f"Fitted {len(result['glm_models'])} GLMs.")
+
+'''
 
 class AnalysisPipeline:
     def __init__(self, steps):
@@ -214,3 +304,4 @@ if __name__ == '__main__':
     X_neural = result['X_neural']
     print("Embed shape:", X_embed.shape)
     print("Neural shape:", X_neural.shape)
+'''

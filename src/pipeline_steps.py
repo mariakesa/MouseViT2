@@ -162,69 +162,103 @@ class AllenViTRegressionDatasetBuilder(PipelineStep):
 
         data['X_embed'] = X_embed
         return data
-class L1vRidgeGLMFitStep(PipelineStep):
-    def __init__(self, Cs=np.logspace(-3, 1, 6), num_tune_neurons=10, num_models_per_neuron=10, tuning_sample_fraction=0.5, n_jobs=-1):
+
+class CSelectionTunerStep(PipelineStep):
+    def __init__(self, Cs=np.logspace(-3, 1, 6), num_tune_neurons=10, tuning_sample_fraction=0.5, n_jobs=-1):
         self.Cs = Cs
         self.num_tune_neurons = num_tune_neurons
-        self.num_models_per_neuron = num_models_per_neuron
         self.tuning_sample_fraction = tuning_sample_fraction
         self.n_jobs = n_jobs
 
     def process(self, data):
         X_embed_raw = data['X_embed']
-        X_embed = clr(X_embed_raw + 1e-6)  # Add small value to avoid log(0)
+        X_embed = clr(X_embed_raw + 1e-6)
         X_neural = data['X_neural']
-        n_neurons = X_neural.shape[1]
 
+        # Filter out neurons with only one class
+        valid_indices = [i for i in range(X_neural.shape[1]) if len(np.unique(X_neural[:, i])) > 1]
+        X_neural = X_neural[:, valid_indices]
+
+        n_neurons = X_neural.shape[1]
         neuron_indices = np.arange(n_neurons)
         rng = np.random.default_rng(seed=42)
         tune_indices = rng.choice(neuron_indices, size=min(self.num_tune_neurons, n_neurons), replace=False)
 
-        # Optionally subsample the data for tuning
+        # Subsample data for tuning
         n_samples = X_embed.shape[0]
         sample_size = int(self.tuning_sample_fraction * n_samples)
         sample_indices = rng.choice(n_samples, size=sample_size, replace=False)
         X_embed_tune = X_embed[sample_indices]
         X_neural_tune = X_neural[sample_indices]
 
-        # Tune C separately for L1 and L2
-        best_Cs = {'l1': None, 'l2': None}
-        for penalty in ['l1', 'l2']:
-            losses = []
-            for i in tune_indices:
-                y = X_neural_tune[:, i]
-                clf = GridSearchCV(
-                    LogisticRegression(penalty=penalty, solver='saga', max_iter=1000),
-                    param_grid={'C': self.Cs},
-                    scoring='neg_log_loss',
-                    cv=3,
-                    n_jobs=self.n_jobs
-                )
+        def fit_and_score(i, C, penalty):
+            y = X_neural_tune[:, i]
+            if len(np.unique(y)) < 2:
+                return None
+            try:
+                clf = LogisticRegression(penalty=penalty, C=C, solver='saga', max_iter=1000)
                 clf.fit(X_embed_tune, y)
-                losses.append((clf.best_score_, clf.best_params_['C']))
-            avg_loss = sorted(losses, key=lambda x: x[0], reverse=True)
-            best_Cs[penalty] = avg_loss[0][1]
+                prob = clf.predict_proba(X_embed_tune)
+                ll = -log_loss(y, prob, labels=[0, 1], normalize=True)
+                return (C, ll)
+            except Exception:
+                return None
 
-        print(f"Best C for L1: {best_Cs['l1']}, Best C for L2: {best_Cs['l2']}")
+        best_Cs = {}
+        for penalty in ['l1', 'l2']:
+            results = Parallel(n_jobs=self.n_jobs)(
+                delayed(fit_and_score)(i, C, penalty)
+                for i in tune_indices
+                for C in self.Cs
+            )
 
-        def fit_best_model_for_neuron(i):
+            C_scores = {C: [] for C in self.Cs}
+            for result in results:
+                if result is not None:
+                    C, ll = result
+                    C_scores[C].append(ll)
+
+            avg_scores = [(np.mean(vals), C) for C, vals in C_scores.items() if vals]
+            best_C = max(avg_scores, key=lambda x: x[0])[1] if avg_scores else self.Cs[0]
+            best_Cs[penalty] = best_C
+
+        data['best_Cs'] = best_Cs
+        print(f"Selected C for L1: {best_Cs['l1']}")
+        print(f"Selected C for L2: {best_Cs['l2']}")
+        return data
+
+class L1vRidgeGLMFitStep(PipelineStep):
+    def __init__(self, n_jobs=-1):
+        self.n_jobs = n_jobs
+
+    def process(self, data):
+        X_embed_raw = data['X_embed']
+        X_embed = clr(X_embed_raw + 1e-6)
+        X_neural = data['X_neural']
+        best_Cs = data['best_Cs']
+
+        # Filter again
+        valid_indices = [i for i in range(X_neural.shape[1]) if len(np.unique(X_neural[:, i])) > 1]
+        X_neural = X_neural[:, valid_indices]
+
+        def fit_model_for_neuron(i):
             y = X_neural[:, i]
+            if len(np.unique(y)) < 2:
+                return {'l1': float('-inf'), 'l2': float('-inf')}
             scores = {}
             for penalty in ['l1', 'l2']:
-                C = best_Cs[penalty]
-                best_ll = -np.inf
-                for _ in range(self.num_models_per_neuron):
-                    clf = LogisticRegression(penalty=penalty, C=C, solver='saga', max_iter=1000)
+                try:
+                    clf = LogisticRegression(penalty=penalty, C=best_Cs[penalty], solver='saga', max_iter=1000)
                     clf.fit(X_embed, y)
                     prob = clf.predict_proba(X_embed)
                     ll = -log_loss(y, prob, labels=[0, 1], normalize=True)
-                    if ll > best_ll:
-                        best_ll = ll
-                scores[penalty] = best_ll
+                    scores[penalty] = ll
+                except Exception:
+                    scores[penalty] = float('-inf')
             return scores
 
         results = Parallel(n_jobs=self.n_jobs)(
-            delayed(fit_best_model_for_neuron)(i) for i in range(n_neurons)
+            delayed(fit_model_for_neuron)(i) for i in range(X_neural.shape[1])
         )
 
         avg_log_likelihoods = {'l1': [], 'l2': []}
@@ -234,11 +268,9 @@ class L1vRidgeGLMFitStep(PipelineStep):
 
         data['avg_log_likelihoods'] = avg_log_likelihoods
 
-        # Save to file
-        output_file = Path("likelihoods_summary.pkl")
-        with open(output_file, 'wb') as f:
+        with open(Path("likelihoods_summary.pkl"), 'wb') as f:
             pickle.dump(avg_log_likelihoods, f)
-        print(f"Saved average log-likelihoods to {output_file}")
+        print("Saved average log-likelihoods to likelihoods_summary.pkl")
         return data
 
 class AnalysisPipeline:
@@ -287,15 +319,18 @@ if __name__ == '__main__':
         ImageToEmbeddingStep(embedding_cache_dir),
         AllenNeuralResponseExtractor(boc, eid_dict, stimulus_session_dict),
         AllenViTRegressionDatasetBuilder(),
+        CSelectionTunerStep(),
         L1vRidgeGLMFitStep(n_jobs=-1)
     ])
-
+    import time
+    start=time.time()
     result = pipeline.run((container_id, session, stimulus))
-
+    end=time.time()
     print("Embed shape:", result['X_embed'].shape)
     print("Neural shape:", result['X_neural'].shape)
     print("L1 log-likelihoods:", result['avg_log_likelihoods']['l1'])
-    print("Ridge log-likelihoods:", result['avg_log_likelihoods']['l2'])  
+    print("Ridge log-likelihoods:", result['avg_log_likelihoods']['l2'])
+    print('Time taken', end-start)
 '''
     
 class L1vRidgeGLMFitStep(PipelineStep):

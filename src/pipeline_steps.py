@@ -268,7 +268,7 @@ class L1vRidgeGLMFitStep(PipelineStep):
 
         data['avg_log_likelihoods'] = avg_log_likelihoods
 
-        with open(Path("likelihoods_summary.pkl"), 'wb') as f:
+        with open(Path("likelihoods_summary_natural_scenes.pkl"), 'wb') as f:
             pickle.dump(avg_log_likelihoods, f)
         print("Saved average log-likelihoods to likelihoods_summary.pkl")
         return data
@@ -311,7 +311,8 @@ if __name__ == '__main__':
     container_id = list(eid_dict.keys())[0]
     session = list(eid_dict[container_id].keys())[0]
     stimulus = stimulus_session_dict.get(session, [])[0]
-
+    session='three_session_B'
+    stimulus='natural_scenes'
     print(f"Running pipeline for container_id={container_id}, session={session}, stimulus={stimulus}")
 
     pipeline = AnalysisPipeline([

@@ -172,7 +172,7 @@ class CSelectionTunerStep(PipelineStep):
 
     def process(self, data):
         X_embed_raw = data['X_embed']
-        X_embed = clr(X_embed_raw + 1e-6)
+        X_embed = np.random.permutation(clr(X_embed_raw + 1e-6))
         X_neural = data['X_neural']
 
         # Filter out neurons with only one class
@@ -268,7 +268,7 @@ class L1vRidgeGLMFitStep(PipelineStep):
 
         data['avg_log_likelihoods'] = avg_log_likelihoods
 
-        with open(Path("likelihoods_summary_natural_scenes.pkl"), 'wb') as f:
+        with open(Path("likelihoods_summary_natural_scenes_randomized.pkl"), 'wb') as f:
             pickle.dump(avg_log_likelihoods, f)
         print("Saved average log-likelihoods to likelihoods_summary.pkl")
         return data

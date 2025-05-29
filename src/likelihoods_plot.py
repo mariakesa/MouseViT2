@@ -7,6 +7,9 @@ import numpy as np
 with open("likelihoods_summary_natural_scenes.pkl", "rb") as f:
     likelihoods = pickle.load(f)
 
+print(likelihoods)
+
+'''
 l1_scores = np.array(likelihoods['l1'])
 l2_scores = np.array(likelihoods['l2'])
 
@@ -28,5 +31,6 @@ plt.title('Neuron-wise Log-Likelihoods: L1 vs L2 Regularization')
 plt.legend()
 plt.grid(True)
 plt.tight_layout()
-plt.savefig("l1_vs_l2_likelihoods_natural_scenes.png")
+plt.savefig("l1_vs_l2_likelihoods_natural_scenes_randomized.png")
 plt.show()
+'''

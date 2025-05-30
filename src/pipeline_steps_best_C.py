@@ -245,6 +245,97 @@ class CompressionBottleneckAnalysisStep(PipelineStep):
 
         print(f"Saved compression bottleneck results to {save_path.resolve()}")
         return data
+    
+class CompressionBottleneckEventOnlyStep(PipelineStep):
+    def __init__(self, Cs=np.logspace(-3, 1, 10), tuning_sample_fraction=0.5, n_jobs=-1):
+        self.Cs = Cs
+        self.tuning_sample_fraction = tuning_sample_fraction
+        self.n_jobs = n_jobs
+
+    def process(self, data):
+        X_embed_raw = data['X_embed']
+        X_neural = data['X_neural']
+        X_embed_real = clr(X_embed_raw + 1e-6)
+
+        # Fixed permutation for reproducibility
+        rng = np.random.default_rng(seed=123)
+        perm_indices = rng.permutation(X_embed_real.shape[0])
+        X_embed_perm = X_embed_real[perm_indices]
+
+        # Filter neurons with only one class
+        valid_indices = [i for i in range(X_neural.shape[1]) if len(np.unique(X_neural[:, i])) > 1]
+        X_neural = X_neural[:, valid_indices]
+
+        # Subsample for tuning
+        n_samples = X_embed_real.shape[0]
+        sample_size = int(self.tuning_sample_fraction * n_samples)
+        sample_indices = rng.choice(n_samples, size=sample_size, replace=False)
+
+        Xr, Xp = X_embed_real[sample_indices], X_embed_perm[sample_indices]
+        Yr = X_neural[sample_indices]
+
+        def fit_ll_event_only(X, y, C):
+            if len(np.unique(y)) < 2:
+                return float('-inf')
+            try:
+                clf = LogisticRegression(penalty='l2', C=C, solver='saga', max_iter=1000)
+                clf.fit(X, y)
+                prob = clf.predict_proba(X)
+                # Focus only on the log-likelihood at y == 1
+                event_mask = y == 1
+                if not np.any(event_mask):
+                    return float('-inf')
+                event_probs = prob[event_mask, 1]
+                event_ll = np.mean(np.log(event_probs + 1e-8))  # mean log-likelihood of true class
+                return event_ll
+            except Exception:
+                return float('-inf')
+
+        def score_C(C):
+            real_lls = []
+            perm_lls = []
+            for i in range(Yr.shape[1]):
+                y = Yr[:, i]
+                ll_real = fit_ll_event_only(Xr, y, C)
+                ll_perm = fit_ll_event_only(Xp, y, C)
+                real_lls.append(ll_real)
+                perm_lls.append(ll_perm)
+            real_lls = np.array(real_lls)
+            perm_lls = np.array(perm_lls)
+            delta = real_lls - perm_lls
+            return {
+                'C': C,
+                'real': real_lls.tolist(),
+                'perm': perm_lls.tolist(),
+                'delta': delta.tolist(),
+                'mean_delta': np.mean(delta)
+            }
+
+        results = Parallel(n_jobs=self.n_jobs)(
+            delayed(score_C)(C) for C in self.Cs
+        )
+
+        best_result = max(results, key=lambda x: x['mean_delta'])
+
+        # Store results
+        data['event_only_bottleneck_results'] = results
+        data['best_C_event_only'] = best_result['C']
+        data['max_mean_event_only_delta'] = best_result['mean_delta']
+
+        # Save to file
+        save_path = Path("compression_event_only_results.pkl")
+        with open(save_path, "wb") as f:
+            pickle.dump({
+                'all_results': results,
+                'best_C': best_result['C'],
+                'max_mean_delta': best_result['mean_delta']
+            }, f)
+
+        print(f"[Event-Only] Best C (bottleneck): {best_result['C']}")
+        print(f"[Event-Only] Max mean delta (LL real - permuted, y==1 only): {best_result['mean_delta']:.5f}")
+        print(f"[Event-Only] Saved to {save_path.resolve()}")
+
+        return data
 
 class AnalysisPipeline:
     def __init__(self, steps):
@@ -293,7 +384,8 @@ if __name__ == '__main__':
         ImageToEmbeddingStep(embedding_cache_dir),
         AllenNeuralResponseExtractor(boc, eid_dict, stimulus_session_dict),
         AllenViTRegressionDatasetBuilder(),
-        CompressionBottleneckAnalysisStep()
+        #CompressionBottleneckAnalysisStep()
+        CompressionBottleneckEventOnlyStep()
     ])
     import time
     start=time.time()

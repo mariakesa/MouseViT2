@@ -137,7 +137,7 @@ class MergeEmbeddingsStep(PipelineStep):
         return data
 
 class ConfidenceIntervalValidationStep(PipelineStep):
-    def __init__(self, C=10.0, alpha=0.05, n_jobs=-1):
+    def __init__(self, C=0.001, alpha=0.05, n_jobs=-1):
         self.C = C
         self.alpha = alpha
         self.n_jobs = n_jobs
@@ -234,7 +234,7 @@ class ConfidenceIntervalValidationStep(PipelineStep):
         data['ci_accuracy_real'] = accuracies_real
         data['ci_accuracy_perm'] = accuracies_perm
 
-        with open("ci_accuracy_comparison.pkl", "wb") as f:
+        with open("ci_accuracy_comparison_0.001.pkl", "wb") as f:
             pickle.dump({
                 'real': accuracies_real,
                 'perm': accuracies_perm
@@ -242,6 +242,80 @@ class ConfidenceIntervalValidationStep(PipelineStep):
 
         print("Saved confidence interval accuracy comparison to ci_accuracy_comparison.pkl")
         return data
+
+class CrossValEventOnlyLogLikelihoodStep(PipelineStep):
+    def __init__(self, C=0.001, n_jobs=-1):
+        self.C = C
+        self.n_jobs = n_jobs
+
+    def process(self, data):
+        merged_folds = data['merged_folds']
+        n_neurons = merged_folds[0][0].shape[1]
+
+        def process_neuron(i_neuron):
+            real_lls, perm_lls = [], []
+
+            for (Xn_train, Xe_train_raw, Xn_test, Xe_test_raw, _, _) in merged_folds:
+                try:
+                    # Normalize embeddings
+                    Xe_train = clr(Xe_train_raw + 1e-6).astype(np.float32)
+                    Xe_test = clr(Xe_test_raw + 1e-6).astype(np.float32)
+                    Xe_train_perm = np.random.permutation(Xe_train)
+
+                    y_train = Xn_train[:, i_neuron]
+                    y_test = Xn_test[:, i_neuron]
+
+                    if len(np.unique(y_train)) < 2:
+                        continue
+
+                    # Train real model
+                    model_real = LogisticRegression(penalty='l2', C=self.C, solver='saga', max_iter=1000)
+                    model_real.fit(Xe_train, y_train)
+                    prob_real = model_real.predict_proba(Xe_test)[:, 1]
+
+                    # Train permuted model
+                    model_perm = LogisticRegression(penalty='l2', C=self.C, solver='saga', max_iter=1000)
+                    model_perm.fit(Xe_train_perm, y_train)
+                    prob_perm = model_perm.predict_proba(Xe_test)[:, 1]
+
+                    # Evaluate only on spikes (y == 1)
+                    mask = y_test == 1
+                    if not np.any(mask):
+                        continue
+
+                    ll_real = np.mean(np.log(prob_real[mask] + 1e-8))
+                    ll_perm = np.mean(np.log(prob_perm[mask] + 1e-8))
+
+                    real_lls.append(ll_real)
+                    perm_lls.append(ll_perm)
+                except Exception:
+                    continue
+
+            # Average across folds
+            avg_real = np.mean(real_lls) if real_lls else float('-inf')
+            avg_perm = np.mean(perm_lls) if perm_lls else float('-inf')
+            return avg_real, avg_perm
+
+        results = Parallel(n_jobs=self.n_jobs)(
+            delayed(process_neuron)(i) for i in range(n_neurons)
+        )
+
+        real_lls = np.array([r[0] for r in results])
+        perm_lls = np.array([r[1] for r in results])
+
+        data['event_only_loglik_real'] = real_lls
+        data['event_only_loglik_perm'] = perm_lls
+
+        with open("event_only_loglik_cv_0.001.pkl", "wb") as f:
+            pickle.dump({
+                'real': real_lls,
+                'perm': perm_lls,
+                'delta': real_lls - perm_lls
+            }, f)
+
+        print("Saved event-only log-likelihoods (cross-validated) to event_only_loglik_cv.pkl")
+        return data
+
 
 
 
@@ -268,7 +342,8 @@ if __name__ == '__main__':
         ImageToEmbeddingStep(embedding_cache_dir),
         StimulusGroupKFoldSplitterStep(boc, eid_dict, stimulus_session_dict),
         MergeEmbeddingsStep(),
-        ConfidenceIntervalValidationStep()
+        #ConfidenceIntervalValidationStep()
+        CrossValEventOnlyLogLikelihoodStep()
     ])
     import time
     start=time.time()
